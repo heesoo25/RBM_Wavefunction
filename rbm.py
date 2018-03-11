@@ -1,34 +1,42 @@
-############################################################
+##################################
 ##
-## Restricted Boltzmann Machine for calculating ground
-## wavefunction of fermionic quantum systems.
+## Restricted Boltzmann Machine implementation in Python to
+## calculate ground wavefunction of fermionic quantum
+## systems
 ##
 ## By Heesoo Kim
 ##
-## Updated: 02/19/2018
+## Updated: 03/11/2018
 ##
 ## IN PROGRESS
 ##
 ############################################################
 
 import numpy as np
-import tensorflow as tf
+import tables
 import os
-import csv
+import time
 
 class RBM(object):
 
-    def __init__(self, num_visible, num_hidden, learning_rate, ID):
+    def __init__(self, lattice_size, num_hidden, h=10, history=False,
+        learning_rate=0.01, ID=''):
 
-        self.num_visible = num_visible  # Number of visible units
+        self.lattice_size = lattice_size
+        self.num_visible = lattice_size * lattice_size  # Number of visible units
         self.num_hidden = num_hidden  # Number of hidden units
         self.learning_rate = learning_rate
 
         self.ID = ID
+        self.h = h
+
+        self.history = history
 
         self.weights = None  # Neural network weights
         self.visible_bias = None # Neural network visible bias
         self.hidden_bias = None # Neural network hidden_bias
+
+        self.energy = None
 
         self.visible_units = None
         self.hidden_units = None
@@ -38,13 +46,31 @@ class RBM(object):
         self.hidden_bias_history = None
 
 
-    def fit(self):
+    def fit(self, num_train_steps, history_frequency=1):
+        if type(history_frequency) is not int:
+            raise TypeError('history_frequency must be an integer.')
+        if history_frequency < 0 or history_frequency == 0:
+            raise ValueError('history_frequency must be a positive integer.')
+        self._create_directories()
+        self._initialize()
+        self._train(num_train_steps, history_frequency)
 
-        _create_directories()
-        _initialize_weights_biases()
+
+    def _train(self, num_train_steps, history_frequency):
+        reps = int(num_train_steps / history_frequency)
+        for _ in range(reps):
+            for _ in range(history_frequency):
+                self._training_step()
+            if self.history:
+                self._save_parameters()
+            print 'The free energy of the system is: %s' % self.energy
 
 
     def _create_directories(self):
+
+        time_now = time.strftime('%y, %m, %d, %H, %M, %S').split(', ')
+        date = ''.join(time_now[:3])
+        self.ID += '%s-%s' % (date, ''.join(time_now[3:]))
 
         dir_path = os.getcwd()
         if dir_path[-1] is not '/':
@@ -53,12 +79,40 @@ class RBM(object):
         if not os.path.exists(history_dir):
             os.makedirs(history_dir)
             print 'Directory for storing histories has been created.'
-        self.weights_history = '%s/weights_%s.csv' % (history_dir, self.ID)
-        self.visible_bias_history = '%s/visible_bias_%s.csv' % (history_dir, self.ID)
-        self.hidden_bias_history = '%s/hidden_bias_%s.csv' % (history_dir, self.ID)
+        today_dir = '%s/%s' % (history_dir, date)
+        if not os.path.exists(today_dir):
+            os.makedirs(today_dir)
+            print 'Directory for storing today\'s histories has been created.'
+
+        weights_dir = '%s/weights_%s.h5' % (today_dir, self.ID)
+        weights_file = tables.open_file(
+            weights_dir,
+            mode='w',
+            title='Weights and Biases History')
+        weights_atom = tables.FloatAtom(shape=(self.num_visible, self.num_hidden))
+        visible_bias_atom = tables.FloatAtom(shape=(self.num_visible,))
+        hidden_bias_atom = tables.FloatAtom(shape=(self.num_hidden,))
+        self.weights_history = weights_file.create_earray(
+            weights_file.root,
+            'weights',
+            title='Historical weights for trial %s' % self.ID,
+            atom=weights_atom,
+            shape=(0,))
+        self.visible_bias_history = weights_file.create_earray(
+            weights_file.root,
+            'visible_bias',
+            title='Historical visible biases for trial %s' % self.ID,
+            atom=visible_bias_atom,
+            shape=(0,))
+        self.hidden_bias_history = weights_file.create_earray(
+            weights_file.root,
+            'hidden_bias',
+            title='Historical hidden biases for trial %s' % self.ID,
+            atom=hidden_bias_atom,
+            shape=(0,))
 
 
-    def _initialize_weights_biases_states(self):
+    def _initialize(self):
 
         # Initialize weights to random values chosen from zero-mean Gaussian
         # distribution with a standard deviation of 0.01.
@@ -76,28 +130,30 @@ class RBM(object):
         self.hidden_bias = np.zeros(self.num_hidden, dtype=float)
 
         # Initialize hidden states
-        self.hidden_units = np.random.randint(2, size=self.num_hidden)
+        self.hidden_units = 2 * np.random.randint(2, size=self.num_hidden) - \
+            np.ones(self.num_hidden)
+        self.visible_units = 2 * np.random.randint(2, size=self.num_visible) - \
+            np.ones(self.num_visible)
+
+        print self.hidden_units
+
+        self.energy = self._current_free_energy()
 
 
     def _training_step(self):
 
-        initial_expectation = _get_expectation()
-        _hidden_units_update()
-        _visible_units_update()
-        reconstructed_expectation = _get_expectation()
-        _weights_update(initial_expectation, reconstructed_expectation)
-
-        _save_parameters()
+        initial_energy = self.energy
+        self._hidden_units_update()
+        self._visible_units_update()
+        self.energy = self._current_free_energy()
+        self._weights_update(initial_energy, self.energy)
 
 
     def _save_parameters(self):
 
-        with open(self.visible_bias_history, 'a') as file:
-            file.writerow(self.visible_bias)
-            file.close()
-        with open(self.hidden_bias_history, 'a') as file:
-            file.writerow(self.hidden_bias)
-            file.close()
+        self.weights_history.append([self.weights])
+        self.visible_bias_history.append([self.visible_bias])
+        self.hidden_bias_history.append([self.hidden_bias])
 
 
     def _hidden_units_update(self):
@@ -109,13 +165,15 @@ class RBM(object):
             current_weights = self.weights[:, h]
             total_input = np.dot(
                 current_weights, self.visible_units) + self.hidden_bias[h]
-            probability = _sigmoid(total_input)
+            probability = self._sigmoid(total_input)
             if probability is not None:
                 new_hidden_units[h] = np.random.binomial(n=1, p=probability)
             else:
                 new_hidden_units[h] = self.hidden_units[h]
 
-        self.hidden_units = new_hidden_units
+        self.hidden_units = new_hidden_units * 2 - np.ones(
+            self.num_hidden, dtype=float)
+        print self.hidden_units
 
 
     def _visible_units_update(self):
@@ -127,10 +185,14 @@ class RBM(object):
             current_weights = self.weights[v, :]
             total_input = np.dot(
                 current_weights, self.hidden_units) + self.visible_bias[v]
-            probability = _sigmoid(total_input)
-            new_visible_units[v] = probability
+            probability = self._sigmoid(total_input)
+            if probability is not None:
+                new_visible_units[v] = np.random.binomial(n=1, p=probability)
+            else:
+                new_visible_units[v] = self.visible_units[v]
 
-        self.visible_units = new_visible_units
+        self.visible_units = new_visible_units * 2 - np.ones(
+            self.num_visible, dtype=float)
 
 
     def _sigmoid(self, total_input):
@@ -148,19 +210,27 @@ class RBM(object):
         self.weights += weights_update
 
 
-    def calculate_wavefunction(self, input_data):
+    def _current_free_energy(self):
+        lattice = self.lattice_size
+        config = self.visible_units.reshape((lattice, lattice))
+        energy = np.sum(np.multiply(config[1:, :], config[:lattice - 1, :])) + \
+            np.sum(np.multiply(config[:, 1:], config[:, :lattice - 1])) + \
+            np.sum(np.multiply(config[0, :], config[lattice - 1, :])) + \
+            np.sum(np.multiply(config[:, 0], config[:, lattice - 1]))
+        return -energy - self.h * np.sum(self.visible_units)
 
-        reshape = np.reshape(input_data, self.num_visible)
-
-        weight_sum = 0
-        for v in range (self.num_visible):
-            for h in range (self.num_hidden):
-                weight_sum += self.weights[v][h] * input_data[v] * hidden_units[h]
-
-        visible_sum = np.dot(reshape, self.visible_bias)
-        hidden_sum = np.dot(self.hidden_state, self.hidden_bias)
-
-        return np.sum(np.exp(weight_sum + visible_sum + hidden_sum))
-
+    
+    def get_visible_bias(self):
+        return self.visible_bias
 
 
+    def get_hidden_bias(self):
+        return self.hidden_bias
+
+
+    def get_weights(self):
+        return self.weights
+
+
+rbm = RBM(70, 2, history=False)
+rbm.fit(10)
